@@ -95,7 +95,7 @@
     "temporal-polyfill": "0.3.2",
     "uuid": "11.1.0",
     "validator": "13.15.26",
-    "ws": "8.20.0",
+    "ws": "8.20.1",
     "zod": "3.25.76"
   },
   "devDependencies": {
