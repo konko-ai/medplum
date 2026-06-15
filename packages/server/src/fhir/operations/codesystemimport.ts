@@ -10,8 +10,9 @@ import type {
   OperationDefinition,
   OperationDefinitionParameter,
 } from '@medplum/fhirtypes';
-import type { PoolClient } from 'pg';
 import { getAuthenticatedContext } from '../../context';
+import { DatabaseMode } from '../../database';
+import type { PgQueryable } from '../sql';
 import { Condition, InsertQuery, SelectQuery } from '../sql';
 import { buildOutputParameters, parseInputParameters } from './utils/parameters';
 import { findTerminologyResource, parentProperty, selectCoding, uniqueOn } from './utils/terminology';
@@ -113,7 +114,8 @@ export async function codeSystemImportHandler(req: FhirRequest): Promise<FhirRes
   }
 
   try {
-    await repo.withTransaction(async (db) => {
+    await repo.withTransaction(async (txRepo) => {
+      const db = txRepo.getDatabaseClient(DatabaseMode.WRITER);
       await importCodeSystem(db, codeSystem, params.concept, params.property, params.designation);
     });
   } catch (err) {
@@ -123,7 +125,7 @@ export async function codeSystemImportHandler(req: FhirRequest): Promise<FhirRes
 }
 
 export async function importCodeSystem(
-  db: PoolClient,
+  db: PgQueryable,
   codeSystem: WithId<CodeSystem>,
   concepts?: Coding[],
   properties?: ImportedProperty[],
@@ -175,7 +177,7 @@ export async function importCodeSystem(
 async function processProperties(
   importedProperties: ImportedProperty[],
   codeSystem: WithId<CodeSystem>,
-  db: PoolClient
+  db: PgQueryable
 ): Promise<void> {
   const cache: Record<string, { id: number; property: CodeSystemProperty }> = Object.create(null);
   const lookupCodes = new Set<string>();
@@ -236,7 +238,7 @@ async function processProperties(
 async function resolveProperty(
   codeSystem: CodeSystem,
   code: string,
-  db: PoolClient
+  db: PgQueryable
 ): Promise<[number, CodeSystemProperty]> {
   let prop = codeSystem.property?.find((p) => p.code === code);
   if (!prop) {

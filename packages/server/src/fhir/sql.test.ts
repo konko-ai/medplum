@@ -1,12 +1,13 @@
 // SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
 // SPDX-License-Identifier: Apache-2.0
 import type { Client, PoolClient } from 'pg';
-import type { CTE, Operator } from './sql';
+import type { CTE, Operator, PgQueryable } from './sql';
 import {
   Column,
   Condition,
   Constant,
   InsertQuery,
+  isPoolClient,
   isValidColumnName,
   isValidTableName,
   MAX_INDEX_DATA_BYTES,
@@ -482,5 +483,22 @@ describe('truncateTextColumn', () => {
     expect(new TextEncoder().encode(result).length).toBeLessThanOrEqual(MAX_INDEX_DATA_BYTES);
     // Should keep all ASCII chars + 1 emoji (exactly MAX_INDEX_DATA_BYTES bytes)
     expect(result).toBe('a'.repeat(asciiLen) + '\u{1F600}');
+  });
+});
+
+describe('isPoolClient', () => {
+  test('returns true for a client with a release function', () => {
+    const client = { query: jest.fn(), release: jest.fn() } as PgQueryable;
+    expect(isPoolClient(client)).toBe(true);
+  });
+
+  test('returns false for a pool without a release function', () => {
+    const pool = { query: jest.fn() } as PgQueryable;
+    expect(isPoolClient(pool)).toBe(false);
+  });
+
+  test('returns false when release is not a function', () => {
+    const notAClient = { query: jest.fn(), release: true } as PgQueryable;
+    expect(isPoolClient(notAClient)).toBe(false);
   });
 });

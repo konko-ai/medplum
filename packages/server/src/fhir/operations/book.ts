@@ -164,10 +164,10 @@ export async function appointmentBookHandler(req: FhirRequest): Promise<FhirResp
   const actors = await ctx.repo.readReferences(schedules.flatMap((schedule) => schedule.actor));
   assertAllOk(actors, 'Schedule.actor load failed', 'Parameters.parameter[%i].schedule.actor');
 
-  const bufferSlots: Slot[] = [];
-
   const createdResources = await ctx.repo.withTransaction(
-    async () => {
+    async (txRepo) => {
+      const bufferSlots: Slot[] = [];
+
       await Promise.all(
         proposedSlots.map(async (proposedSlot, index) => {
           const schedule = schedules.find((s) => `Schedule/${s.id}` === proposedSlot.schedule.reference);
@@ -195,7 +195,7 @@ export async function appointmentBookHandler(req: FhirRequest): Promise<FhirResp
           const searchStart = addMinutes(startDate, -1 * bufferBeforeMax).toISOString();
           const searchEnd = addMinutes(endDate, bufferAfterMax).toISOString();
 
-          const existingSlots = await ctx.repo.searchResources<Slot>({
+          const existingSlots = await txRepo.searchResources<Slot>({
             resourceType: 'Slot',
             count: DEFAULT_MAX_SEARCH_COUNT,
             filters: [
@@ -280,15 +280,15 @@ export async function appointmentBookHandler(req: FhirRequest): Promise<FhirResp
 
       const createdSlots = await Promise.all(
         proposedSlots.map((slot) =>
-          ctx.repo.createResource({
+          txRepo.createResource({
             ...slot,
             status: 'busy',
           })
         )
       );
-      const createdBufferSlots = await Promise.all(bufferSlots.map((slot) => ctx.repo.createResource(slot)));
+      const createdBufferSlots = await Promise.all(bufferSlots.map((slot) => txRepo.createResource(slot)));
 
-      const appointment = await ctx.repo.createResource<Appointment>({
+      const appointment = await txRepo.createResource<Appointment>({
         resourceType: 'Appointment',
         status: 'booked',
         slot: createdSlots.map((slot) => ({ reference: getReferenceString(slot) })),
