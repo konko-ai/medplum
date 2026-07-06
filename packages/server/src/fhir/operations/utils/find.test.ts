@@ -128,6 +128,82 @@ describe('findAlignedSlotTimes', () => {
     ]);
   });
 
+  test('slot alignment by values that do not evenly divide an hour', () => {
+    // Adapted from upstream #9488: slots align to a fifty-minute grid anchored
+    // at UTC midnight. The first slot is found at `00:00`.
+    const slots50Midnight = findAlignedSlotTimes(
+      { start: new Date('2025-12-01T00:00:00Z'), end: new Date('2025-12-01T03:00:00Z') },
+      { alignment: 50, offsetMinutes: 0, durationMinutes: 10 }
+    );
+    expect(slots50Midnight).toEqual([
+      { start: new Date('2025-12-01T00:00:00Z'), end: new Date('2025-12-01T00:10:00Z') },
+      { start: new Date('2025-12-01T00:50:00Z'), end: new Date('2025-12-01T01:00:00Z') },
+      { start: new Date('2025-12-01T01:40:00Z'), end: new Date('2025-12-01T01:50:00Z') },
+      { start: new Date('2025-12-01T02:30:00Z'), end: new Date('2025-12-01T02:40:00Z') },
+    ]);
+
+    // When searching does not start at midnight, we still find slots aligned
+    // to the same fifty-minute grid.
+    const slots50Later = findAlignedSlotTimes(
+      { start: new Date('2025-12-01T01:00:00Z'), end: new Date('2025-12-01T03:00:00Z') },
+      { alignment: 50, offsetMinutes: 0, durationMinutes: 10 }
+    );
+    expect(slots50Later).toEqual([
+      { start: new Date('2025-12-01T01:40:00Z'), end: new Date('2025-12-01T01:50:00Z') },
+      { start: new Date('2025-12-01T02:30:00Z'), end: new Date('2025-12-01T02:40:00Z') },
+    ]);
+  });
+
+  test('free fragment after a booking stays on the daily grid (ENG-908 regression)', () => {
+    // A 16:40-19:20 America/Costa_Rica (UTC-6) availability block with 40-minute
+    // slots, where 16:40-17:20 is already booked. The remaining fragment starts
+    // at 17:20 local (23:20Z) and must yield 17:20/18:00/18:40 local - the same
+    // grid as the unbooked block - NOT re-phase to 17:40/18:20 the way
+    // minute-of-hour alignment does.
+    const bookedFragment = findAlignedSlotTimes(
+      { start: new Date('2026-07-22T23:20:00Z'), end: new Date('2026-07-23T01:20:00Z') },
+      { alignment: 40, offsetMinutes: 0, durationMinutes: 40 }
+    );
+    expect(bookedFragment).toEqual([
+      { start: new Date('2026-07-22T23:20:00Z'), end: new Date('2026-07-23T00:00:00Z') },
+      { start: new Date('2026-07-23T00:00:00Z'), end: new Date('2026-07-23T00:40:00Z') },
+      { start: new Date('2026-07-23T00:40:00Z'), end: new Date('2026-07-23T01:20:00Z') },
+    ]);
+
+    // The unbooked block produces the same grid, starting at 16:40 local. The
+    // block spans UTC midnight; the grid stays continuous across it because 40
+    // divides 1440.
+    const unbookedBlock = findAlignedSlotTimes(
+      { start: new Date('2026-07-22T22:40:00Z'), end: new Date('2026-07-23T01:20:00Z') },
+      { alignment: 40, offsetMinutes: 0, durationMinutes: 40 }
+    );
+    expect(unbookedBlock).toEqual([
+      { start: new Date('2026-07-22T22:40:00Z'), end: new Date('2026-07-22T23:20:00Z') },
+      { start: new Date('2026-07-22T23:20:00Z'), end: new Date('2026-07-23T00:00:00Z') },
+      { start: new Date('2026-07-23T00:00:00Z'), end: new Date('2026-07-23T00:40:00Z') },
+      { start: new Date('2026-07-23T00:40:00Z'), end: new Date('2026-07-23T01:20:00Z') },
+    ]);
+  });
+
+  test('alignment not dividing 1440: grid continues across UTC midnight within one interval', () => {
+    // 50 does not divide 1440, so a daily grid cannot be continuous across
+    // midnight. Within a single contiguous interval we keep stepping the grid
+    // of the day the interval started in (23:20 -> 00:10 -> 01:00 -> 01:50).
+    // Upstream #9488 instead re-anchors at each midnight (00:00/00:50/01:40);
+    // the difference only affects alignments that do not divide 1440, which no
+    // real configuration uses, and disappears on upgrade to >= 5.1.19.
+    const slots = findAlignedSlotTimes(
+      { start: new Date('2025-12-01T23:00:00Z'), end: new Date('2025-12-02T02:00:00Z') },
+      { alignment: 50, offsetMinutes: 0, durationMinutes: 10 }
+    );
+    expect(slots).toEqual([
+      { start: new Date('2025-12-01T23:20:00Z'), end: new Date('2025-12-01T23:30:00Z') },
+      { start: new Date('2025-12-02T00:10:00Z'), end: new Date('2025-12-02T00:20:00Z') },
+      { start: new Date('2025-12-02T01:00:00Z'), end: new Date('2025-12-02T01:10:00Z') },
+      { start: new Date('2025-12-02T01:50:00Z'), end: new Date('2025-12-02T02:00:00Z') },
+    ]);
+  });
+
   test('errors when alignment is zero', () => {
     expect(() => {
       findAlignedSlotTimes(
