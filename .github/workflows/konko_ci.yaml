@@ -1,0 +1,116 @@
+name: Konko Medplum CI
+
+# Builds the Konko fork of the Medplum server as a Docker image.
+#
+# - pull_request: build only (validates the image can be built)
+# - push of a `v*-konko*` tag: build and push to ghcr.io/konko-ai/medplum-server,
+#   image tag == git tag (e.g. v5.1.5-konko.1)
+#
+# The tarball steps mirror scripts/build-docker-server.sh, which we cannot use
+# directly: it hardcodes multi-arch platforms, supply-chain attestations, and a
+# package.json-derived tag scheme. The image is built from Dockerfile.konko
+# (public base images) because the upstream Dockerfile pulls from dhi.io, which
+# requires upstream's Docker Hardened Images subscription.
+
+on:
+  push:
+    tags: ['v*-konko*']
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: konko-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  release-image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    env:
+      REGISTRY: ghcr.io
+      IMAGE_NAME: konko-ai/medplum-server
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build server packages
+        run: npx turbo run build --filter=@medplum/server
+
+      # Pure unit tests for the scheduling operations (no database needed).
+      # Gates the konko aligner backport carried on top of upstream v5.1.5.
+      - name: Run scheduling unit tests
+        run: |
+          npm test -w packages/server -- \
+            src/fhir/operations/utils/find.test.ts \
+            src/fhir/operations/utils/scheduling.test.ts \
+            src/fhir/operations/utils/scheduling-parameters.test.ts
+
+      # Same file lists as scripts/build-docker-server.sh
+      - name: Build server tarballs
+        run: |
+          tar \
+            --no-xattrs \
+            -czf medplum-server-metadata.tar.gz \
+            package.json \
+            package-lock.json \
+            packages/bot-layer/package.json \
+            packages/ccda/package.json \
+            packages/core/package.json \
+            packages/definitions/package.json \
+            packages/fhir-router/package.json \
+            packages/server/package.json
+          tar \
+            --no-xattrs \
+            --exclude='*.ts' \
+            --exclude='*.tsbuildinfo' \
+            -czf medplum-server-runtime.tar.gz \
+            LICENSE.txt \
+            NOTICE \
+            packages/ccda/dist \
+            packages/core/dist \
+            packages/definitions/dist \
+            packages/fhir-router/dist \
+            packages/server/dist
+
+      - name: Set image tag
+        id: image_tag
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            echo "tag=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=pr-${{ github.event.number }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to container registry
+        if: github.event_name == 'push'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.konko
+          platforms: linux/amd64
+          push: ${{ github.event_name == 'push' }}
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.image_tag.outputs.tag }}
+          cache-from: type=gha,scope=konko-medplum-server
+          cache-to: type=gha,mode=max,scope=konko-medplum-server

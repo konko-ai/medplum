@@ -1,0 +1,30 @@
+# Konko variant of ./Dockerfile.
+#
+# Identical two-stage layout, but built FROM public Docker Hub images instead
+# of dhi.io Docker Hardened Images, which require a subscription login that
+# only upstream Medplum has. Keep the stages in sync with ./Dockerfile when
+# syncing from upstream.
+#
+# This Dockerfile depends on files created by the tarball steps in
+# .github/workflows/konko_ci.yaml (same content as scripts/build-docker-server.sh):
+#  1. `medplum-server-metadata.tar.gz` - package.json and package-lock.json files
+#  2. `medplum-server-runtime.tar.gz` - compiled JavaScript files and other runtime assets
+
+# Stage 1: Build the application and install production dependencies
+FROM node:24-slim AS build-stage
+ENV NODE_ENV=production
+WORKDIR /usr/src/medplum
+ADD ./medplum-server-metadata.tar.gz ./
+RUN npm ci --omit=dev && \
+  rm package-lock.json
+
+# Stage 2: Create the runtime image
+FROM node:24-slim AS runtime-stage
+ENV NODE_ENV=production
+WORKDIR /usr/src/medplum
+COPY --from=build-stage /usr/src/medplum/ ./
+ADD ./medplum-server-runtime.tar.gz ./
+
+EXPOSE 5000 8103
+
+ENTRYPOINT [ "node", "--require", "./packages/server/dist/otel/instrumentation.js", "packages/server/dist/index.js" ]
