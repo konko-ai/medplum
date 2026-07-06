@@ -31,7 +31,7 @@ function mod(n: number, d: number): number {
  *
  * @param interval - The interval to find slots within
  * @param options - The alignment parameters
- * @param options.alignment - An hour divisor to align to; should be in range [1, 60]
+ * @param options.alignment - Minutes between slot starts; the grid is anchored at UTC midnight (shifted by offsetMinutes). Must be >= 1.
  * @param options.offsetMinutes - A number of minutes to offset the alignment by
  * @param options.durationMinutes - How long each slot should last
  * @param options.maxCount - Maximum number of intervals to find
@@ -47,13 +47,20 @@ export function findAlignedSlotTimes(
   }
 ): Interval[] {
   if (options.alignment < 1) {
-    throw new Error(`Invalid alignment; must be in range [1,60], got ${options.alignment}`);
+    throw new Error(`Invalid alignment; must be positive, got ${options.alignment}`);
   }
 
   const firstMinuteStart = advanceToMinuteMark(interval.start);
 
-  // Find how much we need to shift the interval start to hit an alignment
-  const remainder = mod(firstMinuteStart.getMinutes() - options.offsetMinutes, options.alignment);
+  // Find how much we need to shift the interval start to hit an alignment.
+  // The grid is anchored at UTC midnight, not at the top of the hour:
+  // minute-of-hour anchoring re-phases the grid every hour, which breaks
+  // alignment intervals that do not divide 60 (e.g. 40-minute slots).
+  // Konko backport of upstream #9488, without the alignmentTimezone option
+  // and per-day grid re-anchoring - both equivalent to this for any alignment
+  // that divides 1440. Remove when upgrading to medplum >= 5.1.19.
+  const minutesSinceUtcMidnight = firstMinuteStart.getUTCHours() * 60 + firstMinuteStart.getUTCMinutes();
+  const remainder = mod(minutesSinceUtcMidnight - options.offsetMinutes, options.alignment);
   const toAlign = remainder === 0 ? 0 : options.alignment - remainder;
 
   // set start/end to the first interval boundaries
