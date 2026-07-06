@@ -185,6 +185,25 @@ describe('findAlignedSlotTimes', () => {
     ]);
   });
 
+  test('alignment not dividing 1440: grid continues across UTC midnight within one interval', () => {
+    // 50 does not divide 1440, so a daily grid cannot be continuous across
+    // midnight. Within a single contiguous interval we keep stepping the grid
+    // of the day the interval started in (23:20 -> 00:10 -> 01:00 -> 01:50).
+    // Upstream #9488 instead re-anchors at each midnight (00:00/00:50/01:40);
+    // the difference only affects alignments that do not divide 1440, which no
+    // real configuration uses, and disappears on upgrade to >= 5.1.19.
+    const slots = findAlignedSlotTimes(
+      { start: new Date('2025-12-01T23:00:00Z'), end: new Date('2025-12-02T02:00:00Z') },
+      { alignment: 50, offsetMinutes: 0, durationMinutes: 10 }
+    );
+    expect(slots).toEqual([
+      { start: new Date('2025-12-01T23:20:00Z'), end: new Date('2025-12-01T23:30:00Z') },
+      { start: new Date('2025-12-02T00:10:00Z'), end: new Date('2025-12-02T00:20:00Z') },
+      { start: new Date('2025-12-02T01:00:00Z'), end: new Date('2025-12-02T01:10:00Z') },
+      { start: new Date('2025-12-02T01:50:00Z'), end: new Date('2025-12-02T02:00:00Z') },
+    ]);
+  });
+
   test('errors when alignment is zero', () => {
     expect(() => {
       findAlignedSlotTimes(
