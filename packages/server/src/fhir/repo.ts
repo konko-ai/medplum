@@ -442,6 +442,7 @@ export class Repository extends FhirRepository implements Disposable {
   }
 
   private rateLimiter(): FhirRateLimiter | undefined {
+    this.assertUsable();
     return this.isSuperAdmin() ? undefined : tryGetRequestContext()?.fhirRateLimiter;
   }
 
@@ -1076,6 +1077,7 @@ export class Repository extends FhirRepository implements Disposable {
    * @param resource - The candidate resource to validate.
    */
   async validateResource(resource: Resource): Promise<void> {
+    this.assertUsable();
     if (this.context.strictMode) {
       await this.validateResourceStrictly(resource);
     } else {
@@ -1095,6 +1097,7 @@ export class Repository extends FhirRepository implements Disposable {
   }
 
   async validateResourceStrictly(resource: Resource): Promise<void> {
+    this.assertUsable();
     const logger = getLogger();
     const start = process.hrtime.bigint();
 

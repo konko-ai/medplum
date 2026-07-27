@@ -33,7 +33,6 @@ const unguardedMembers = new Set<PropertyKey>([
   'getConfig',
   'isSuperAdmin',
   'isProjectAdmin',
-  'supportsRangeSearch',
   'supportsInteraction',
   'canPerformInteraction',
   'getAuthor',
@@ -42,7 +41,6 @@ const unguardedMembers = new Set<PropertyKey>([
   'addDeletedFilter',
   'addSecurityFilters',
   'isClosed',
-  'validateBinarySecurityContext',
   'clone',
 ]);
 
@@ -51,6 +49,16 @@ const unguardedMembers = new Set<PropertyKey>([
  * any new method added to Repository to be classified as guarded, unguarded, or private.
  */
 const knownPrivateMembers = new Set<PropertyKey>([
+  // 5.1.5-era members that upstream later extracted to repository/ modules (drift not backported)
+  'rateLimiter',
+  'validateProfiles',
+  'validateTerminology',
+  'loadProfile',
+  'buildResourceRow',
+  'buildColumn',
+  'buildColumnValues',
+  'buildPeriodColumn',
+  'removeField',
   'resourceCap',
   'getProjectById',
   'readResourceImpl',
@@ -64,7 +72,6 @@ const knownPrivateMembers = new Set<PropertyKey>([
   'writeToDatabase',
   'checkExistingResource',
   'isNotModified',
-  'getPermittedProjectIds',
   'addProjectFilters',
   'addAccessPolicyFilters',
   'writeResource',
@@ -91,7 +98,6 @@ const knownPrivateMembers = new Set<PropertyKey>([
   'deleteCacheEntries',
   'createTransactionScopedRepo',
   'assertUsable',
-  'authorizeBinarySecurityContext',
 ]);
 
 interface MethodInvocation {
@@ -121,6 +127,16 @@ const guardedInvocations: MethodInvocation[] = [
   { name: 'preCommit', kind: 'method', invoke: (repo) => repo.preCommit(async () => undefined) },
   { name: 'postCommit', kind: 'method', invoke: (repo) => repo.postCommit(async () => undefined) },
   { name: 'ensureInTransaction', kind: 'method', invoke: (repo) => repo.ensureInTransaction(async () => undefined) },
+  {
+    name: 'validateResource',
+    kind: 'method',
+    invoke: (repo) => repo.validateResource({ resourceType: 'Patient' }),
+  },
+  {
+    name: 'validateResourceStrictly',
+    kind: 'method',
+    invoke: (repo) => repo.validateResourceStrictly({ resourceType: 'Patient' }),
+  },
 
   // Reads
   {
