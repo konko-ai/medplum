@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
 // SPDX-License-Identifier: Apache-2.0
 import type { WithId } from '@medplum/core';
-import { OperationOutcomeError, Operator, conflict, notFound, parseSearchRequest, sleep } from '@medplum/core';
+import { conflict, notFound, OperationOutcomeError, Operator, parseSearchRequest, sleep } from '@medplum/core';
 import type { Patient, Project } from '@medplum/fhirtypes';
 import { randomUUID } from 'node:crypto';
 import type { PoolClient } from 'pg';
@@ -912,9 +912,9 @@ describe('FHIR Repo Transactions', () => {
       const errorSpy = jest.spyOn(getLogger(), 'error').mockImplementation(() => {});
 
       try {
-        await expect(borrowedRepo.withTransaction(async () => Promise.reject(new Error('work failed')))).rejects.toThrow(
-          'work failed'
-        );
+        await expect(
+          borrowedRepo.withTransaction(async () => Promise.reject(new Error('work failed')))
+        ).rejects.toThrow('work failed');
 
         // The repository only borrowed this PoolClient, so it drops its local reference
         // after the fatal rollback path but never releases a client it does not own.
