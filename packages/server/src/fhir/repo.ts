@@ -86,6 +86,7 @@ import type {
   StructureDefinition,
   ValueSet,
 } from '@medplum/fhirtypes';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { Readable } from 'node:stream';
 import type { Pool, PoolClient } from 'pg';
 import type { Operation } from 'rfc6902';
@@ -273,6 +274,14 @@ export interface ProcessAllResourcesOptions {
 }
 
 /**
+ * Tracks the repository whose withTransaction() callback is currently executing in this
+ * async context. Repositories derived from it (getSystemRepo()) use this to share the
+ * transaction only when they are used lexically inside the callback; unrelated concurrent
+ * flows see no store value and operate on independent connections.
+ */
+const transactionContextStore = new AsyncLocalStorage<Repository>();
+
+/**
  * The Repository class manages reading and writing to the FHIR repository.
  * It is a thin layer on top of the database.
  * Repository instances should be created per author and project.
@@ -280,13 +289,16 @@ export interface ProcessAllResourcesOptions {
 export class Repository extends FhirRepository<PoolClient> implements Disposable {
   private readonly context: RepositoryContext;
   private conn?: PoolClient;
+  private readonly parent?: Repository;
   private readonly disposable: boolean = true;
+  private borrowedConnLost = false;
   private transactionDepth = 0;
   private closed = false;
   mode: RepositoryMode;
 
   private preCommitCallbacks: (() => Promise<void>)[] = [];
   private postCommitCallbacks: (() => Promise<void>)[] = [];
+  private callbackMarks: { pre: number; post: number }[] = [];
 
   /**
    * The version to be set on resources when they are inserted/updated into the database.
@@ -311,17 +323,28 @@ export class Repository extends FhirRepository<PoolClient> implements Disposable
    */
   static readonly VERSION: number = 13;
 
-  constructor(context: RepositoryContext, conn?: PoolClient) {
+  constructor(context: RepositoryContext, conn?: PoolClient, parent?: Repository) {
     super();
     this.context = context;
-    this.context.projects?.push(syntheticR4Project);
+    if (this.context.projects && !this.context.projects.some((p) => p.id === syntheticR4Project.id)) {
+      // Repositories can share a context object (e.g. via clone()); the synthetic R4 project
+      // must not be appended to the shared projects list more than once.
+      this.context.projects.push(syntheticR4Project);
+    }
     if (!this.context.author?.reference) {
       throw new Error('Invalid author reference');
     }
 
     if (conn) {
+      // An explicitly-provided client is only borrowed: its lifecycle belongs to the caller.
       this.conn = conn;
       this.disposable = false;
+    } else if (parent) {
+      // Derived repository (see getSystemRepo()): reads through the parent's connection while
+      // used inside the parent's active transaction callback, and uses the pool otherwise.
+      // It never holds a PoolClient reference of its own for the parent's transaction, so it
+      // cannot touch a connection that has been returned to the pool. See transactionOwner().
+      this.parent = parent;
     }
 
     // Default to writer mode
@@ -330,8 +353,15 @@ export class Repository extends FhirRepository<PoolClient> implements Disposable
     this.mode = RepositoryMode.WRITER;
   }
 
+  /**
+   * Creates a new repository with the same context but no shared connection or transaction
+   * state. Since a cloned Repository doesn't share a connection, cloning is safe for
+   * out-of-band work at any point of the Repository's life-cycle.
+   * @param conn - Optional explicit database client for the clone to borrow.
+   * @returns A new detached repository with the same context.
+   */
   clone(conn?: PoolClient): Repository {
-    return new Repository(this.context, conn ?? this.conn);
+    return new Repository(this.context, conn);
   }
 
   get shardId(): string {
@@ -340,11 +370,13 @@ export class Repository extends FhirRepository<PoolClient> implements Disposable
 
   /**
    * Use this when you need elevated privileges within request handling.
-   * This reuses the same DB connection, if one exists, to stay within the same transaction.
+   * The returned repository shares this repository's transaction scope while one is active
+   * (reads see uncommitted writes; its own writes nest as savepoints; commit hooks defer to
+   * the real commit), and operates independently on pooled connections otherwise.
    * @returns a SystemRepository for the same shard as this repository.
    */
   getSystemRepo(): SystemRepository {
-    return createSystemRepository(this.shardId, this.conn);
+    return createSystemRepository(this.shardId, undefined, this);
   }
 
   setMode(mode: RepositoryMode): void {
@@ -510,8 +542,8 @@ export class Repository extends FhirRepository<PoolClient> implements Disposable
 
     const resource = JSON.parse(rows[0].content as string) as WithId<T>;
 
-    if (!this.transactionDepth) {
-      // Only set cache entry if not in a transaction
+    if (!this.inTransactionScope()) {
+      // Only set cache entry if not in a transaction (own or inherited transaction scope)
       await this.setCacheEntry(resource);
     }
 
@@ -2453,7 +2485,14 @@ export class Repository extends FhirRepository<PoolClient> implements Disposable
 
     if (getConfig().saveAuditEvents && isResource(resource) && resource?.resourceType !== 'AuditEvent') {
       auditEvent.id = this.generateId();
-      this.updateResourceImpl(auditEvent, true).catch(console.error);
+      // Use a detached clone for the out-of-band save (upstream #9734): the un-awaited write
+      // must not run on this repository's connection, where it would race the mainline
+      // transaction and could execute on a client already returned to the pool.
+      const saveRepo = this.clone();
+      saveRepo
+        .updateResourceImpl(auditEvent, true)
+        .catch((err) => getLogger().error('Failed to save AuditEvent', err))
+        .finally(() => saveRepo[Symbol.dispose]());
     }
   }
 
@@ -2467,11 +2506,63 @@ export class Repository extends FhirRepository<PoolClient> implements Disposable
    * @param mode - The database mode.
    * @returns The database client.
    */
+  /**
+   * Returns the repository whose active transaction this repository is currently scoped to,
+   * or undefined when there is none. A repository is scoped to a transaction only when the
+   * currently-executing async context is lexically inside that transaction's withTransaction
+   * callback (tracked via AsyncLocalStorage), and the transaction owner is this repository
+   * itself or an ancestor (via getSystemRepo()).
+   *
+   * Temporally-overlapping work on a derived repository from an unrelated async flow is NOT
+   * scoped to the ancestor's transaction: it runs independently on its own pooled connection,
+   * exactly like two unrelated repositories.
+   * @returns The transaction-owning repository, or undefined if not in a transaction scope.
+   */
+  private transactionOwner(): Repository | undefined {
+    const active = transactionContextStore.getStore();
+    if (!active || active.transactionDepth <= 0) {
+      return undefined;
+    }
+    if (active === this) {
+      return active;
+    }
+    for (let p = this.parent; p; p = p.parent) {
+      if (p === active) {
+        return active;
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * Returns true when this repository is inside a transaction: either holding one open
+   * itself, or scoped to an ancestor's transaction (see transactionOwner()).
+   * @returns True if in a transaction scope.
+   */
+  private inTransactionScope(): boolean {
+    return this.transactionDepth > 0 || this.transactionOwner() !== undefined;
+  }
+
+  private assertBorrowedConnAvailable(): void {
+    if (this.borrowedConnLost) {
+      throw new Error('Borrowed repository connection is no longer available');
+    }
+  }
+
   getDatabaseClient(mode: DatabaseMode): Pool | PoolClient {
     this.assertNotClosed();
+    this.assertBorrowedConnAvailable();
     if (this.conn) {
-      // If in a transaction, then use the transaction client.
+      // If in a transaction (or borrowing a caller-provided client), then use that client.
       return this.conn;
+    }
+    const owner = this.transactionOwner();
+    if (owner?.conn) {
+      // Lexically scoped to an ancestor's active transaction: read through its client so
+      // this repository sees the transaction's uncommitted writes. Once the owner releases
+      // the connection this returns nothing, so a derived repository can never use a
+      // connection that has already been returned to the pool.
+      return owner.conn;
     }
     if (mode === DatabaseMode.WRITER) {
       // If we ever use a writer, then all subsequent operations must use a writer.
@@ -2488,6 +2579,7 @@ export class Repository extends FhirRepository<PoolClient> implements Disposable
    */
   private async getConnection(mode: DatabaseMode): Promise<PoolClient> {
     this.assertNotClosed();
+    this.assertBorrowedConnAvailable();
     this.conn ??= await getDatabasePool(mode).connect();
     return this.conn;
   }
@@ -2499,9 +2591,24 @@ export class Repository extends FhirRepository<PoolClient> implements Disposable
    * @param err - Optional error to remove the connection from the pool.
    */
   private releaseConnection(err?: boolean | Error): void {
-    if (this.conn && this.disposable) {
-      this.conn.release(err);
+    const conn = this.conn;
+    if (!conn) {
+      return;
+    }
+    if (this.disposable) {
       this.conn = undefined;
+      try {
+        conn.release(err);
+      } catch (releaseErr) {
+        // pg-pool throws if release() is called twice (e.g. socket already errored out).
+        // We've done our part; just log and move on.
+        getLogger().warn('Error releasing database client', { err: normalizeErrorString(releaseErr) });
+      }
+    } else if (err) {
+      // Borrowed connection is known to be dead. Drop our reference so we don't reuse it;
+      // the owner of the connection is responsible for the actual release.
+      this.conn = undefined;
+      this.borrowedConnLost = true;
     }
   }
 
@@ -2509,6 +2616,14 @@ export class Repository extends FhirRepository<PoolClient> implements Disposable
     callback: (client: PoolClient) => Promise<TResult>,
     options?: { serializable: boolean }
   ): Promise<TResult> {
+    this.assertNotClosed();
+    const owner = this.transactionOwner();
+    if (owner && owner !== this) {
+      // Scoped to an ancestor's active transaction: nest there (as a savepoint) instead of
+      // issuing BEGIN/COMMIT with this repository's own (zero) transaction depth, which
+      // would prematurely commit or roll back the ancestor's transaction.
+      return owner.withTransaction(callback, options);
+    }
     const config = getConfig();
     const transactionAttempts = config.transactionAttempts ?? defaultTransactionAttempts;
     let error: OperationOutcomeError | undefined;
@@ -2516,7 +2631,10 @@ export class Repository extends FhirRepository<PoolClient> implements Disposable
       const attemptStartTime = Date.now();
       try {
         const client = await this.beginTransaction(options?.serializable ? 'SERIALIZABLE' : undefined);
-        const result = await callback(client);
+        // Execute the callback with this repository recorded as the active transaction owner,
+        // so repositories derived from it (getSystemRepo()) within the callback's async flow
+        // share the transaction, while unrelated concurrent flows do not.
+        const result = await transactionContextStore.run(this, () => callback(client));
         await this.commitTransaction();
         if (attempt > 0) {
           getLogger().info('Completed transaction', {
@@ -2578,6 +2696,7 @@ export class Repository extends FhirRepository<PoolClient> implements Disposable
   private async beginTransaction(isolationLevel: TransactionIsolationLevel = 'REPEATABLE READ'): Promise<PoolClient> {
     this.assertNotClosed();
     this.transactionDepth++;
+    this.callbackMarks.push({ pre: this.preCommitCallbacks.length, post: this.postCommitCallbacks.length });
     const conn = await this.getConnection(DatabaseMode.WRITER);
     if (this.transactionDepth === 1) {
       await conn.query('BEGIN ISOLATION LEVEL ' + isolationLevel);
@@ -2594,25 +2713,73 @@ export class Repository extends FhirRepository<PoolClient> implements Disposable
       await this.processPreCommit();
       await conn.query('COMMIT');
       this.transactionDepth--;
+      this.callbackMarks.pop();
       this.releaseConnection();
       await this.processPostCommit();
     } else {
       await conn.query('RELEASE SAVEPOINT sp' + this.transactionDepth);
       this.transactionDepth--;
+      // Callbacks registered inside the released savepoint now belong to the outer frame.
+      this.callbackMarks.pop();
     }
   }
 
   private async rollbackTransaction(error: Error): Promise<void> {
-    this.assertInTransaction();
-    const conn = await this.getConnection(DatabaseMode.WRITER);
-    if (this.transactionDepth === 1) {
-      await conn.query('ROLLBACK');
-      this.transactionDepth--;
-      this.releaseConnection(error);
-    } else {
-      await conn.query('ROLLBACK TO SAVEPOINT sp' + this.transactionDepth);
-      this.transactionDepth--;
+    if (this.transactionDepth <= 0) {
+      // Tolerate being called after state has already been reset (e.g. when a prior
+      // cleanup path fully aborted the transaction on a dead connection).
+      return;
     }
+    const conn = await this.getConnection(DatabaseMode.WRITER);
+    const isOuter = this.transactionDepth === 1;
+    try {
+      if (isOuter) {
+        await conn.query('ROLLBACK');
+      } else {
+        await conn.query('ROLLBACK TO SAVEPOINT sp' + this.transactionDepth);
+      }
+    } catch (rollbackErr) {
+      // ROLLBACK itself failed - the connection is almost certainly dead (e.g. killed by
+      // idle_in_transaction_session_timeout). Reset all transaction state and release the
+      // client with the original error so pg-pool discards it instead of leaking the slot.
+      getLogger().warn('Error rolling back transaction', {
+        err: normalizeErrorString(rollbackErr),
+        originalErr: normalizeErrorString(error),
+      });
+      this.abortTransaction(error);
+      return;
+    }
+    this.transactionDepth--;
+    this.truncateCallbacksToMark();
+    if (isOuter) {
+      this.releaseConnection(error);
+    }
+  }
+
+  /**
+   * Discards commit hooks registered inside the transaction level being rolled back,
+   * so a retry (or the surviving outer transaction) does not execute them.
+   */
+  private truncateCallbacksToMark(): void {
+    const mark = this.callbackMarks.pop();
+    if (mark) {
+      this.preCommitCallbacks.length = mark.pre;
+      this.postCommitCallbacks.length = mark.post;
+    }
+  }
+
+  /**
+   * Fully aborts the transaction hierarchy: resets depth, drops pending pre/post-commit
+   * callbacks, and releases the connection with an error so pg-pool discards it. Invoked
+   * from the rollback error path when recovery on the current connection is not possible.
+   * @param err - The error that triggered the abort; forwarded to release().
+   */
+  private abortTransaction(err: Error): void {
+    this.transactionDepth = 0;
+    this.callbackMarks = [];
+    this.preCommitCallbacks = [];
+    this.postCommitCallbacks = [];
+    this.releaseConnection(err);
   }
 
   private endTransaction(): void {
@@ -2628,8 +2795,11 @@ export class Repository extends FhirRepository<PoolClient> implements Disposable
   }
 
   async preCommit(fn: () => Promise<void>): Promise<void> {
-    if (this.transactionDepth) {
-      this.preCommitCallbacks.push(fn);
+    const owner = this.transactionOwner();
+    if (owner) {
+      // Register on the transaction owner so the hook fires at the real commit,
+      // even when this repository is a derived repo scoped to an ancestor's transaction.
+      owner.preCommitCallbacks.push(fn);
     } else {
       // rely on thrown errors bubbling up from here to halt the transaction
       await fn();
@@ -2646,8 +2816,11 @@ export class Repository extends FhirRepository<PoolClient> implements Disposable
   }
 
   async postCommit(fn: () => Promise<void>): Promise<void> {
-    if (this.transactionDepth) {
-      this.postCommitCallbacks.push(fn);
+    const owner = this.transactionOwner();
+    if (owner) {
+      // Register on the transaction owner so the hook fires after the real commit,
+      // even when this repository is a derived repo scoped to an ancestor's transaction.
+      owner.postCommitCallbacks.push(fn);
     } else {
       await this.invokePostCommitCallback(fn);
     }
@@ -2683,8 +2856,8 @@ export class Repository extends FhirRepository<PoolClient> implements Disposable
     resourceType: string,
     id: string
   ): Promise<CacheEntry<WithId<T>> | undefined> {
-    // No cache access allowed mid-transaction
-    if (this.transactionDepth) {
+    // No cache access allowed mid-transaction (own or inherited transaction scope)
+    if (this.inTransactionScope()) {
       return undefined;
     }
     const cachedValue = await getCacheRedis().get(getCacheKey(resourceType, id));
@@ -2697,8 +2870,8 @@ export class Repository extends FhirRepository<PoolClient> implements Disposable
    * @returns Array of cache entries or undefined.
    */
   private async getCacheEntries(references: Reference[]): Promise<(CacheEntry | undefined)[]> {
-    // No cache access allowed mid-transaction
-    if (this.transactionDepth) {
+    // No cache access allowed mid-transaction (own or inherited transaction scope)
+    if (this.inTransactionScope()) {
       return new Array(references.length);
     }
 
@@ -2740,8 +2913,9 @@ export class Repository extends FhirRepository<PoolClient> implements Disposable
    * @param resource - The resource to cache.
    */
   private async setCacheEntry(resource: WithId<Resource>): Promise<void> {
-    // No cache access allowed mid-transaction
-    if (this.transactionDepth) {
+    // No cache access allowed mid-transaction (own or inherited transaction scope):
+    // the write is deferred to the transaction owner's post-commit phase.
+    if (this.inTransactionScope()) {
       const cachedResource = deepClone(resource);
       await this.postCommit(() => {
         return this.setCacheEntry(cachedResource);
@@ -2764,8 +2938,8 @@ export class Repository extends FhirRepository<PoolClient> implements Disposable
    * @param id - The resource ID.
    */
   private async deleteCacheEntry(resourceType: string, id: string): Promise<void> {
-    // No cache access allowed mid-transaction
-    if (this.transactionDepth) {
+    // No cache access allowed mid-transaction (own or inherited transaction scope)
+    if (this.inTransactionScope()) {
       await this.postCommit(() => this.deleteCacheEntry(resourceType, id));
       return;
     }
@@ -2779,8 +2953,8 @@ export class Repository extends FhirRepository<PoolClient> implements Disposable
    * @param ids - The resource IDs.
    */
   private async deleteCacheEntries(resourceType: string, ids: string[]): Promise<void> {
-    // No cache access allowed mid-transaction
-    if (this.transactionDepth) {
+    // No cache access allowed mid-transaction (own or inherited transaction scope)
+    if (this.inTransactionScope()) {
       await this.postCommit(() => this.deleteCacheEntries(resourceType, ids));
       return;
     }
@@ -2882,10 +3056,11 @@ export class SystemRepository extends Repository {}
 /**
  * Creates a SystemRepository for the specified shard.
  * @param shardId - The shard ID.
- * @param conn - Optional database connection for transaction support.
+ * @param conn - Optional borrowed database client (caller manages its lifecycle).
+ * @param parent - Optional parent repository whose active transaction scope is shared.
  * @returns A SystemRepository instance.
  */
-function createSystemRepository(shardId: string, conn?: PoolClient): SystemRepository {
+function createSystemRepository(shardId: string, conn?: PoolClient, parent?: Repository): SystemRepository {
   return new SystemRepository(
     {
       shardId,
@@ -2897,7 +3072,8 @@ function createSystemRepository(shardId: string, conn?: PoolClient): SystemRepos
       },
       // System repo does not have an associated Project; it can write to any
     },
-    conn
+    conn,
+    parent
   );
 }
 
